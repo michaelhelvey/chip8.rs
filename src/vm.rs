@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
 use color_eyre::eyre::eyre;
-use crate::screenbuffer::ScreenBuffer;
+use crate::screenbuffer::{ScreenBuffer, ROWS, COLS};
 
 struct VMState {
     registers: [u8; 16],
@@ -169,31 +169,139 @@ impl VM {
     /// ExecutionResult.  The caller is responsible for handling this
     /// information in a way that maintains a consistent framerate and
     /// responsiveness.
-    pub fn render_frame(&mut self, _instruction_count: u64) -> ExecutionResult {
-        self.screenbuffer.buffer[40] = true;
+    pub fn render_frame(&mut self, instruction_count: u64) -> color_eyre::Result<ExecutionResult> {
+        for _ in 0..instruction_count {
+            let pc = self.state.program_counter as usize;
+            if pc + 2 > self.state.memory.len() {
+                panic!("Invalid progam: could not read two bytes from program counter (pc = {:#04X})", pc);
+            }
 
-        ExecutionResult::None
+            let bytes = &self.state.memory[pc..pc + 2];
+            let instruction = Instruction::parse((bytes[0], bytes[1]))?;
+
+            self.execute_instruction(instruction);
+        }
+
+        Ok(ExecutionResult::None)
+    }
+
+    fn increment_program_counter(&mut self, amount: u16) {
+        match self.state.program_counter + amount {
+            0xFFF => {
+                self.state.program_counter = 0x200;
+            },
+            new_value => {
+                self.state.program_counter = new_value
+            }
+        }
+    }
+
+    fn execute_instruction(&mut self, instruction: Instruction) {
+        println!("Executing {:?} (pc = {:#04X})", instruction, self.state.program_counter);
+        match instruction {
+            Instruction::CLS(_) => {
+                self.screenbuffer.clear();
+                self.increment_program_counter(2);
+            }
+            Instruction::JMP(raw) => {
+                let addr = raw.as_u16() & 0x0FFF;
+                self.state.program_counter = addr;
+                // We do not need to increment the program counter because this
+                // instruction manually sets the program counter
+            },
+            Instruction::LDIMM(raw) => {
+                let register = raw.nibble_at(1);
+                self.state.registers[register as usize] = raw.1;
+                self.increment_program_counter(2);
+            },
+            Instruction::ADDIMM(raw) => {
+                let register = raw.nibble_at(1) as usize;
+                let immediate = raw.1;
+                let current_value = self.state.registers[register];
+                self.state.registers[register] = current_value + immediate;
+                self.increment_program_counter(2);
+            },
+            Instruction::SEIMM(raw) => {
+                let register = raw.nibble_at(1);
+                let immediate = raw.1;
+
+                if self.state.registers[register as usize] == immediate {
+                    println!("we should skip the instruction");
+                    // skip next instruction
+                    self.increment_program_counter(4);
+                } else {
+                    self.increment_program_counter(2);
+                }
+            },
+            Instruction::LDIMMI(raw) => {
+                let immediate = raw.as_u16() & 0x0FFF;
+                self.state.index_register = immediate;
+                self.increment_program_counter(2);
+            },
+            Instruction::DRW(raw) => {
+                let starting_addr = self.state.index_register as usize;
+                let sprite_len = raw.nibble_at(3) as usize;
+
+                // Coordinates (wrapped around if larger than screen):
+                let vx = self.state.registers[raw.nibble_at(1) as usize];
+                let vy = self.state.registers[raw.nibble_at(2) as usize];
+                self.state.registers[0xF] = 0;
+
+                // Sprite data, represented as an array of bytes. Each byte is a
+                // row of 8 pixels, each pixel is a column.
+                let sprite_data = &self.state.memory[starting_addr..starting_addr + sprite_len];
+
+                // For each row (byte) in the sprite:
+                for (row, sprite_byte) in sprite_data.iter().enumerate() {
+                    // For each column (pixel) from left to right inside the byte:
+                    for position in 0..8 {
+                        let pixel_value = (sprite_byte & (1 << (7 - position))) > 0;
+
+                        // Render the pixel as an offset from the initial start
+                        // (vx, vy), wrapping when that value would be larger
+                        // than the screen:
+                        let x = (vx + position) as usize % COLS as usize;
+                        let y = vy as usize + row % ROWS as usize;
+                        if self.screenbuffer.write_pixel(pixel_value, x, y) {
+                            self.state.registers[0xF] = 1;
+                        }
+                    }
+                }
+
+                self.increment_program_counter(2);
+            }
+            _ => println!("    -> Unhandled")
+        }
     }
 }
 
-// Most useful initial instructions:
-// 00E0 (clear screen)
-// 1NNN (jump)
-// 6XNN (set register VX)
-// 7XNN (add value to register VX)
-// ANNN (set index register I)
-// DXYN (display/draw)
-
+#[derive(Clone, Copy)]
 struct RawInstruction(u8, u8);
 
 impl RawInstruction {
-    fn nibble_at(&self, idx: usize) -> color_eyre::Result<u8> {
+    fn nibble_at(&self, idx: usize) -> u8 {
         match idx {
-            1 => Ok(self.0 & 0x0F),
-            2 => Ok((self.1 & 0xF0) >> 4),
-            3 => Ok(self.1 & 0x0F),
-            idx => Err(eyre!("RawInstruction#nibble_at: index out of range {}", idx))
+            1 => self.0 & 0x0F,
+            2 => (self.1 & 0xF0) >> 4,
+            3 => self.1 & 0x0F,
+            idx => panic!("index out of range {}", idx)
         }
+    }
+
+    fn as_u16(&self) -> u16 {
+        u16::from_be_bytes([self.0, self.1])
+    }
+}
+
+impl std::fmt::Display for RawInstruction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "0x{:02X}{:02X}", self.0, self.1)
+    }
+}
+
+impl std::fmt::Debug for RawInstruction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "RawInstruction(0x{:02X}{:02X})", self.0, self.1)
     }
 }
 
@@ -202,6 +310,7 @@ impl RawInstruction {
 /// immediate value, while "REG" is used to denote an operation between two
 /// registers.  Finally, "R" is used as a prefix to denote a operation that is
 /// the reverse of another operation (e.g. Vy - Vx instead of Vx - Vy)
+#[derive(Debug)]
 enum Instruction {
     /// 0NNN - Jump to a machine code routine at NNN
     SYS(RawInstruction),
@@ -292,7 +401,7 @@ impl Instruction {
             5 => Ok(Instruction::SEREG(ri)),
             6 => Ok(Instruction::LDIMM(ri)),
             7 => Ok(Instruction::ADDIMM(ri)),
-            8 => match ri.nibble_at(3)? {
+            8 => match ri.nibble_at(3) {
                 0 => Ok(Instruction::LDREG(ri)),
                 1 => Ok(Instruction::ORREG(ri)),
                 2 => Ok(Instruction::ANDREG(ri)),
@@ -302,7 +411,7 @@ impl Instruction {
                 6 => Ok(Instruction::SHR(ri)),
                 7 => Ok(Instruction::RSUBREG(ri)),
                 0xE => Ok(Instruction::SHL(ri)),
-                op => Err(eyre!("Unknown 0x8xxx opcode {:?}", op))
+                _ => Err(eyre!("Unknown 0x8xxx opcode 0x{:02X}{:02X}", bytes.0, bytes.1))
             },
             9 => Ok(Instruction::SNEREG(ri)),
             0xA => Ok(Instruction::LDIMMI(ri)),
@@ -312,7 +421,7 @@ impl Instruction {
             0xE => match bytes.1 {
                 0x9E => Ok(Instruction::SKP(ri)),
                 0xA1 => Ok(Instruction::SKNP(ri)),
-                op => Err(eyre!("Unknown 0xEx opcode {:?}", op))
+                _ => Err(eyre!("Unknown 0xEx opcode 0x{:02X}{:02X}", bytes.0, bytes.1))
             },
             0xF => match bytes.1 {
                 0x07 => Ok(Instruction::LDDELAY(ri)),
@@ -324,7 +433,7 @@ impl Instruction {
                 0x33 => Ok(Instruction::LDIDECIMAL(ri)),
                 0x55 => Ok(Instruction::STOREREG(ri)),
                 0x65 => Ok(Instruction::LDMEM(ri)),
-                op => Err(eyre!("Unknown 0xFx opcode {:?}", op)),
+                _ => Err(eyre!("Unknown 0xFx opcode 0x{:02X}{:02X}", bytes.0, bytes.1)),
             },
             seq => Err(eyre!("Unknown bytes sequence {:#04X}", seq))
         }
@@ -338,8 +447,22 @@ mod tests {
     #[test] 
     fn test_raw_instruction_parse() {
         let instruction = RawInstruction(0x1F, 0x23);
-        assert_eq!(instruction.nibble_at(1).unwrap(), 15);
-        assert_eq!(instruction.nibble_at(2).unwrap(), 2);
-        assert_eq!(instruction.nibble_at(3).unwrap(), 3);
+        assert_eq!(instruction.nibble_at(1), 15);
+        assert_eq!(instruction.nibble_at(2), 2);
+        assert_eq!(instruction.nibble_at(3), 3);
+    }
+
+    #[test]
+    fn test_raw_instruction_display() {
+        let instruction = RawInstruction(0x1F, 0x23);
+        assert_eq!(format!("{}", instruction), "0x1F23");
+    }
+
+    #[test]
+    fn test_raw_instruction_u16_byte_order() {
+        // 00001011 00100010
+        let instruction = RawInstruction(11, 34);
+        assert_eq!(instruction.as_u16(), 2850);
+        assert_eq!(instruction.as_u16() & 0x0FFF, 2850);
     }
 }
