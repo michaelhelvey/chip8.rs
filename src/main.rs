@@ -72,9 +72,12 @@ fn main() -> color_eyre::Result<()> {
 
         // Render a frame, passing in the number of instructions that should be
         // executed per frame:
-        vm.render_frame(CLOCK_SPEED / FRAME_RATE);
+        let _exe_result = vm.render_frame(CLOCK_SPEED / FRAME_RATE);
         draw_to_buffer(vm.screenbuffer(), &mut canvas)?;
         canvas.present();
+
+        // TODO: either sleep, block waiting for a key, draw immediately, etc,
+        // based on what the VM execution result is
 
         // Sleep for however long is left in the frame:
         let frame_end = Instant::now();
