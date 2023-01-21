@@ -7,18 +7,14 @@ use sdl2::event::Event;
 use sdl2::pixels::Color;
 use sdl2::rect::Rect;
 use sdl2::render::WindowCanvas;
-use vm::VM;
 
 pub mod screenbuffer;
 pub mod vm;
 
-const ROWS: u32 = 32;
-const COLS: u32 = 64;
-
 // Window configuration:
 const PX_SCALING: u32 = 20;
-const WINDOW_HEIGHT: u32 = ROWS * PX_SCALING;
-const WINDOW_WIDTH: u32 = 64 * PX_SCALING;
+const WINDOW_HEIGHT: u32 = screenbuffer::ROWS * PX_SCALING;
+const WINDOW_WIDTH: u32 = screenbuffer::COLS * PX_SCALING;
 const WINDOW_TITLE: &'static str = "CHIP8 Emulator";
 
 // Color configuration
@@ -56,10 +52,7 @@ fn main() -> color_eyre::Result<()> {
     canvas.present();
 
     let program = load_program_from_file(String::from("./games/IBM.ch8"))?;
-    let vm = VM::acquire();
-    vm.load_program(program.as_slice());
-
-    let screenbuffer = ScreenBuffer::acquire();
+    let mut vm = vm::VM::new(program.as_slice());
 
     let mut event_pump = sdl_context
         .event_pump()
@@ -80,7 +73,7 @@ fn main() -> color_eyre::Result<()> {
         // Render a frame, passing in the number of instructions that should be
         // executed per frame:
         vm.render_frame(CLOCK_SPEED / FRAME_RATE);
-        draw_to_buffer(screenbuffer, &mut canvas)?;
+        draw_to_buffer(vm.screenbuffer(), &mut canvas)?;
         canvas.present();
 
         // Sleep for however long is left in the frame:
@@ -100,9 +93,9 @@ fn draw_to_buffer(
     screenbuffer: &ScreenBuffer,
     canvas: &mut WindowCanvas,
 ) -> color_eyre::Result<()> {
-    for row in 0..ROWS {
-        for col in 0..COLS {
-            let pixel = screenbuffer.buffer[(row * col) as usize];
+    for row in 0..screenbuffer::ROWS {
+        for col in 0..screenbuffer::COLS {
+            let pixel = screenbuffer.read_pixel(col as usize, row as usize);
 
             let foreground_color = match pixel {
                 true => COLOR_FOREGROUND,

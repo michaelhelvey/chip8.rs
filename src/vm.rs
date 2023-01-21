@@ -1,6 +1,8 @@
 #![allow(dead_code)]
 
-pub struct VM {
+use crate::screenbuffer::ScreenBuffer;
+
+struct VMState {
     registers: [u8; 16],
     index_register: u16,
     delay_timer: u8,
@@ -37,9 +39,9 @@ const FONT_SPRITES: [u8; SPRITE_BYTES_SIZE] = [
 
 // If the Chip8 emulator can have mutable static memory, so can I, silly Rust
 // compiler!
-static mut VM_INSTANCE: VM = VM::new(false);
+static mut VM_INSTANCE: VMState = VMState::new(false);
 
-impl VM {
+impl VMState {
     const fn new(eti_660_mode: bool) -> Self {
         // The ETI 660 computer was unique in starting programs at 0x600 in
         // memory compared to everything else, which started programs at 0x200
@@ -80,7 +82,8 @@ impl VM {
     /// destroy and re-create a VM in the lifetime of the application, but a
     /// program can be loaded dynamically via `load_program`.
     pub fn acquire() -> &'static mut Self {
-        // This is a single threaded program, shut the fuck up, Rust.
+        // SAFTEY: this program is simple and single-threaded, so correct usage
+        // of static mutable memory is easy to verify.
         unsafe {
             &mut VM_INSTANCE
         }
@@ -108,6 +111,28 @@ impl VM {
             self.memory[self.program_counter as usize + idx] = *byte;
         }
     }
+}
+
+pub struct VM {
+    screenbuffer: &'static mut ScreenBuffer,
+    state: &'static mut VMState,
+}
+
+
+impl VM {
+    pub fn new(program: &[u8]) -> Self {
+        let instance = Self {
+            screenbuffer: ScreenBuffer::acquire(),
+            state: VMState::acquire(),
+        };
+
+        instance.state.load_program(program);
+        instance
+    }
+
+    pub fn screenbuffer(&self) -> &ScreenBuffer {
+        return &self.screenbuffer;
+    }
 
     /// Execute enough instructions to render a single frame.  This function
     /// should be called at the game's framerate (probably 60hz, as this is the
@@ -127,5 +152,7 @@ impl VM {
     ///
     /// The caller is responsible for updating the screen and sleeping for an
     /// appropriate amount of time using whatever mechanism it chooses.
-    pub fn render_frame(&mut self, instruction_count: u64) {}
+    pub fn render_frame(&mut self, _instruction_count: u64) {
+        self.screenbuffer.buffer[40] = true;
+    }
 }
