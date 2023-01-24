@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
 use color_eyre::eyre::eyre;
-use crate::screenbuffer::{ScreenBuffer, ROWS, COLS};
+use crate::{screenbuffer::{ScreenBuffer, ROWS, COLS}, keymap::{KeyboardState, Chip8Key}};
 
 struct VMState {
     registers: [u8; 16],
@@ -20,7 +20,7 @@ const SPRITE_COUNT: u8 = 16;
 const SPRITE_BYTES_SIZE: usize = 5 * SPRITE_COUNT as usize;
 
 const FONT_SPRITES: [u8; SPRITE_BYTES_SIZE] = [
-    0x90, 0x90, 0xF0, 0x10, 0x10, // 0
+    0xF0, 0x90, 0x90, 0x90, 0xF0, // 0
     0x20, 0x60, 0x20, 0x20, 0x70, // 1
     0xF0, 0x10, 0xF0, 0x80, 0xF0, // 2
     0xF0, 0x10, 0xF0, 0x10, 0xF0, // 3
@@ -116,9 +116,14 @@ impl VMState {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
 pub enum ExecutionResult {
+    /// Yields execution back to the main game loop; instructs loop to wait for
+    /// a key press and notify the VM at a given register (the u8 value) when
+    /// the press arrives.
     WaitForKey(u8),
-    None,
+    Draw,
+    Nothing,
 }
 
 /// Owns the virtual machine state and screenbuffer.  Since both of those
@@ -127,6 +132,7 @@ pub enum ExecutionResult {
 /// program, and simply expose all operations through this public VM struct.
 pub struct VM {
     screenbuffer: &'static mut ScreenBuffer,
+    keyboard_state: KeyboardState,
     state: &'static mut VMState,
 }
 
@@ -135,6 +141,7 @@ impl VM {
         let instance = Self {
             screenbuffer: ScreenBuffer::acquire(),
             state: VMState::acquire(),
+            keyboard_state: KeyboardState::new(),
         };
 
         instance.state.load_program(program);
@@ -145,11 +152,11 @@ impl VM {
         return &self.screenbuffer;
     }
 
-    /// Execute enough instructions to render a single frame.  This function
-    /// should be called at the game's framerate (probably 60hz, as this is the
-    /// specified rate for decrementing the timer & delay registers).  The VM is
-    /// not responsible for doing this, as the VM doesn't know how to draw
-    /// anything.
+    /// Execute (up to) enough instructions to render a single frame.  This
+    /// function should be called at the game's framerate (probably 60hz, as
+    /// this is the specified rate for decrementing the timer & delay
+    /// registers).  The VM is not responsible for doing this, as the VM doesn't
+    /// know how to draw anything.
     ///
     /// Example:
     ///     cpu clock speed     = 540hz
@@ -165,12 +172,12 @@ impl VM {
     /// appropriate amount of time using whatever mechanism it chooses.
     /// 
     /// Note that if the VM requires certain information from the runtime, such
-    /// as a keypress, then it may return early with the requirements in the
-    /// ExecutionResult.  The caller is responsible for handling this
+    /// as a keypress or draw, then it may return early with the requirements in
+    /// the ExecutionResult.  The caller is responsible for handling this
     /// information in a way that maintains a consistent framerate and
     /// responsiveness.
-    pub fn render_frame(&mut self, instruction_count: u64) -> color_eyre::Result<ExecutionResult> {
-        for _ in 0..instruction_count {
+    pub fn render_frame(&mut self, instruction_count: u64) -> color_eyre::Result<(ExecutionResult, u64)> {
+        for i in 1..instruction_count {
             let pc = self.state.program_counter as usize;
             if pc + 2 > self.state.memory.len() {
                 panic!("Invalid progam: could not read two bytes from program counter (pc = {:#04X})", pc);
@@ -179,10 +186,28 @@ impl VM {
             let bytes = &self.state.memory[pc..pc + 2];
             let instruction = Instruction::parse((bytes[0], bytes[1]))?;
 
-            self.execute_instruction(instruction);
+            let exe_result = self.execute_instruction(instruction);
+
+            if exe_result != ExecutionResult::Nothing {
+                return Ok((exe_result, i));
+            }
         }
 
-        Ok(ExecutionResult::None)
+        Ok((ExecutionResult::Nothing, instruction_count))
+    }
+
+    /// Registers the ExecutionResult::WaitForKey as complete.  Note: does not
+    /// implicitly call `on_keydown`
+    pub fn wait_for_key_complete(&mut self, register: u8, keycode: Chip8Key) {
+        self.state.registers[register as usize] = keycode as u8;
+    }
+
+    pub fn on_keydown(&mut self, keycode: Chip8Key) {
+        self.keyboard_state.on_keydown(keycode);
+    }
+
+    pub fn on_keyup(&mut self, keycode: Chip8Key) { 
+        self.keyboard_state.on_keyup(keycode);
     }
 
     fn increment_program_counter(&mut self, amount: u16) {
@@ -196,43 +221,47 @@ impl VM {
         }
     }
 
-    fn execute_instruction(&mut self, instruction: Instruction) {
+    fn execute_instruction(&mut self, instruction: Instruction) -> ExecutionResult {
         println!("Executing {:?} (pc = {:#04X})", instruction, self.state.program_counter);
         match instruction {
             Instruction::CLS(_) => {
+                // 00E0 - Clear the display
                 self.screenbuffer.clear();
                 self.increment_program_counter(2);
             }
             Instruction::JMP(raw) => {
+                // 1NNN - Jump to location NNN
                 let addr = raw.as_u16() & 0x0FFF;
                 self.state.program_counter = addr;
                 // We do not need to increment the program counter because this
                 // instruction manually sets the program counter
             },
             Instruction::LDIMM(raw) => {
+                // 6xkk - Load the value kk into register Vx
                 let register = raw.nibble_at(1);
                 self.state.registers[register as usize] = raw.1;
                 self.increment_program_counter(2);
             },
             Instruction::ADDIMM(raw) => {
+                // 7xkk - Set Vx = Vx + kk
                 let register = raw.nibble_at(1) as usize;
                 let immediate = raw.1;
                 let current_value = self.state.registers[register];
                 self.state.registers[register] = current_value + immediate;
                 self.increment_program_counter(2);
             },
+            // 3xkk - Skip next instruction if Vx = kk
             Instruction::SEIMM(raw) => {
                 let register = raw.nibble_at(1);
                 let immediate = raw.1;
 
                 if self.state.registers[register as usize] == immediate {
-                    println!("we should skip the instruction");
-                    // skip next instruction
                     self.increment_program_counter(4);
                 } else {
                     self.increment_program_counter(2);
                 }
             },
+            // ANNN - Set register I equal to NNN
             Instruction::LDIMMI(raw) => {
                 let immediate = raw.as_u16() & 0x0FFF;
                 self.state.index_register = immediate;
@@ -269,9 +298,27 @@ impl VM {
                 }
 
                 self.increment_program_counter(2);
-            }
+                return ExecutionResult::Draw;
+            },
+            Instruction::LDSPRITE(raw) => {
+                // Fx29 - Set I to the memory location of the sprite
+                // corresponding to the number in Vx
+                let vx = self.state.registers[raw.nibble_at(1) as usize];
+                self.state.index_register = (5 * vx) as u16;
+                self.increment_program_counter(2);
+            },
+            Instruction::LDKEY(raw) => {
+                // Fx0A - yield execution back to the main game loop until the
+                // user presses a key, after which the value of the key will be
+                // stored in Vx.
+                let reg = raw.nibble_at(1);
+                self.increment_program_counter(2);
+                return ExecutionResult::WaitForKey(reg);
+            },
             _ => println!("    -> Unhandled")
-        }
+        };
+
+        ExecutionResult::Nothing
     }
 }
 
