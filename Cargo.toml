@@ -9,3 +9,6 @@ edition = "2021"
 sdl2 = { version = "0.35" }
 color-eyre = "0.6.2"
 lazy_static = "1.4.0"
+rand = "0.8.5"
+num-derive = "0.3"
+num-traits = "0.2"

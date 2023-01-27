@@ -19,11 +19,25 @@ fn load_program_from_file<P: AsRef<Path>>(path: P) -> color_eyre::Result<Vec<u8>
     Ok(program)
 }
 
-fn main() -> color_eyre::Result<()> {
-    // let program = load_program_from_file(String::from("./games/IBM.ch8"))?;
-    let program = load_program_from_file(String::from("./test_program.ch8"))?;
-    let mut vm = vm::VM::new(program.as_slice());
+fn exit_with_help() {
+    let help = "\
+    Usage: chip8 <program>
+    ";
+    eprintln!("{}", help);
+    std::process::exit(1);
+}
 
+fn main() -> color_eyre::Result<()> {
+    // Load program from cmd line arguments specifying file
+    let args = std::env::args().collect::<Vec<_>>();
+    if args.len() != 2 {
+        exit_with_help();
+    }
+
+    let program = load_program_from_file(&args[1])?;
+
+    // Initialize application state
+    let mut vm = vm::VM::new(program.as_slice());
     let mut graphics_context = GraphicsContext::new()?;
     let mut frame_start = Instant::now();
 
@@ -42,6 +56,7 @@ fn main() -> color_eyre::Result<()> {
             }
         }
 
+        // TODO:  handle decrementing the sound & delay timers
         let (exe_result, exe_count) = vm.render_frame(instructions_to_execute)?;
         match exe_result {
             ExecutionResult::WaitForKey(register) => {
@@ -59,7 +74,7 @@ fn main() -> color_eyre::Result<()> {
                     instructions_to_execute = instructions_per_frame;
                 }
             }
-            ExecutionResult::Nothing => {
+            ExecutionResult::Done => {
                 instructions_to_execute = instructions_per_frame;
                 sleep(&mut frame_start);
             }

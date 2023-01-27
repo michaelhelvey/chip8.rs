@@ -1,7 +1,13 @@
 #![allow(dead_code)]
 
+use crate::{
+    keymap::{Chip8Key, KeyboardState},
+    screenbuffer::{ScreenBuffer, COLS, ROWS},
+};
 use color_eyre::eyre::eyre;
-use crate::{screenbuffer::{ScreenBuffer, ROWS, COLS}, keymap::{KeyboardState, Chip8Key}};
+use num_traits::FromPrimitive;
+use rand::rngs::ThreadRng;
+use rand::Rng;
 
 struct VMState {
     registers: [u8; 16],
@@ -87,9 +93,7 @@ impl VMState {
     pub fn acquire() -> &'static mut Self {
         // SAFTEY: this program is simple and single-threaded, so correct usage
         // of static mutable memory is easy to verify.
-        unsafe {
-            &mut VM_INSTANCE
-        }
+        unsafe { &mut VM_INSTANCE }
     }
 
     /// Loads a program into the memory of the VM starting at the current
@@ -105,8 +109,8 @@ impl VMState {
         if program.len() > available_memory {
             panic!(
                 "VM#load_program: attempted to load program with size {} at memory address {:x}.  Available memory after program counter: {:x} bytes", 
-                program.len(), 
-                self.program_counter, 
+                program.len(),
+                self.program_counter,
                 available_memory
             );
         }
@@ -122,8 +126,12 @@ pub enum ExecutionResult {
     /// a key press and notify the VM at a given register (the u8 value) when
     /// the press arrives.
     WaitForKey(u8),
+    /// Yield execution back to the main game loop with a notification that the
+    /// screenbuffer has been updated.
     Draw,
-    Nothing,
+    /// Yield execution back to the main game loop with no special instructions
+    /// other than that the requested number of instructions have been executed.
+    Done,
 }
 
 /// Owns the virtual machine state and screenbuffer.  Since both of those
@@ -134,6 +142,7 @@ pub struct VM {
     screenbuffer: &'static mut ScreenBuffer,
     keyboard_state: KeyboardState,
     state: &'static mut VMState,
+    rng: ThreadRng,
 }
 
 impl VM {
@@ -142,6 +151,7 @@ impl VM {
             screenbuffer: ScreenBuffer::acquire(),
             state: VMState::acquire(),
             keyboard_state: KeyboardState::new(),
+            rng: rand::thread_rng(),
         };
 
         instance.state.load_program(program);
@@ -170,17 +180,23 @@ impl VM {
     ///
     /// The caller is responsible for updating the screen and sleeping for an
     /// appropriate amount of time using whatever mechanism it chooses.
-    /// 
+    ///
     /// Note that if the VM requires certain information from the runtime, such
     /// as a keypress or draw, then it may return early with the requirements in
     /// the ExecutionResult.  The caller is responsible for handling this
     /// information in a way that maintains a consistent framerate and
     /// responsiveness.
-    pub fn render_frame(&mut self, instruction_count: u64) -> color_eyre::Result<(ExecutionResult, u64)> {
+    pub fn render_frame(
+        &mut self,
+        instruction_count: u64,
+    ) -> color_eyre::Result<(ExecutionResult, u64)> {
         for i in 1..instruction_count {
             let pc = self.state.program_counter as usize;
             if pc + 2 > self.state.memory.len() {
-                panic!("Invalid progam: could not read two bytes from program counter (pc = {:#04X})", pc);
+                panic!(
+                    "Invalid progam: could not read two bytes from program counter (pc = {:#04X})",
+                    pc
+                );
             }
 
             let bytes = &self.state.memory[pc..pc + 2];
@@ -188,12 +204,12 @@ impl VM {
 
             let exe_result = self.execute_instruction(instruction);
 
-            if exe_result != ExecutionResult::Nothing {
+            if exe_result != ExecutionResult::Done {
                 return Ok((exe_result, i));
             }
         }
 
-        Ok((ExecutionResult::Nothing, instruction_count))
+        Ok((ExecutionResult::Done, instruction_count))
     }
 
     /// Registers the ExecutionResult::WaitForKey as complete.  Note: does not
@@ -206,7 +222,7 @@ impl VM {
         self.keyboard_state.on_keydown(keycode);
     }
 
-    pub fn on_keyup(&mut self, keycode: Chip8Key) { 
+    pub fn on_keyup(&mut self, keycode: Chip8Key) {
         self.keyboard_state.on_keyup(keycode);
     }
 
@@ -214,44 +230,44 @@ impl VM {
         match self.state.program_counter + amount {
             0xFFF => {
                 self.state.program_counter = 0x200;
-            },
-            new_value => {
-                self.state.program_counter = new_value
             }
+            new_value => self.state.program_counter = new_value,
         }
     }
 
     fn execute_instruction(&mut self, instruction: Instruction) -> ExecutionResult {
-        println!("Executing {:?} (pc = {:#04X})", instruction, self.state.program_counter);
+        println!(
+            "Executing {:?} (pc = {:#04X})",
+            instruction, self.state.program_counter
+        );
         match instruction {
+            // NOTE: SYS unhandled
             Instruction::CLS(_) => {
                 // 00E0 - Clear the display
                 self.screenbuffer.clear();
                 self.increment_program_counter(2);
             }
+            Instruction::RET(_) => {
+                // 00EE - return from a subroutine
+                // Set the program counter to the address at the top of the
+                // stack, then subtract 1 from the stack pointer.
+                self.state.program_counter = self.state.stack[self.state.stack.len() - 1];
+                self.state.stack_pointer -= 1;
+            }
             Instruction::JMP(raw) => {
                 // 1NNN - Jump to location NNN
                 let addr = raw.as_u16() & 0x0FFF;
                 self.state.program_counter = addr;
-                // We do not need to increment the program counter because this
-                // instruction manually sets the program counter
-            },
-            Instruction::LDIMM(raw) => {
-                // 6xkk - Load the value kk into register Vx
-                let register = raw.nibble_at(1);
-                self.state.registers[register as usize] = raw.1;
-                self.increment_program_counter(2);
-            },
-            Instruction::ADDIMM(raw) => {
-                // 7xkk - Set Vx = Vx + kk
-                let register = raw.nibble_at(1) as usize;
-                let immediate = raw.1;
-                let current_value = self.state.registers[register];
-                self.state.registers[register] = current_value + immediate;
-                self.increment_program_counter(2);
-            },
-            // 3xkk - Skip next instruction if Vx = kk
+            }
+            Instruction::CALL(raw) => {
+                // 2NNN - call subroutine at NNN
+                self.state.stack_pointer += 1;
+                self.state.stack[self.state.stack_pointer as usize] = self.state.program_counter;
+                let routine_addr = raw.as_u16() & 0x0FFF;
+                self.state.program_counter = routine_addr;
+            }
             Instruction::SEIMM(raw) => {
+                // 3xkk - Skip next instruction if Vx = kk
                 let register = raw.nibble_at(1);
                 let immediate = raw.1;
 
@@ -260,13 +276,179 @@ impl VM {
                 } else {
                     self.increment_program_counter(2);
                 }
-            },
-            // ANNN - Set register I equal to NNN
+            }
+            Instruction::SNEIMM(raw) => {
+                // 4xkk - Skip next instruction if Vx != kk
+                let register = raw.nibble_at(1);
+                let immediate = raw.1;
+
+                if self.state.registers[register as usize] != immediate {
+                    self.increment_program_counter(4);
+                } else {
+                    self.increment_program_counter(2);
+                }
+            }
+            Instruction::SEREG(raw) => {
+                // 5xy0 - Skip next instruction if vx = vy
+                let vx = self.state.registers[raw.nibble_at(1) as usize];
+                let vy = self.state.registers[raw.nibble_at(2) as usize];
+
+                if vx == vy {
+                    self.increment_program_counter(4);
+                } else {
+                    self.increment_program_counter(2);
+                }
+            }
+            Instruction::LDIMM(raw) => {
+                // 6xkk - Load the value kk into register Vx
+                let register = raw.nibble_at(1);
+                self.state.registers[register as usize] = raw.1;
+                self.increment_program_counter(2);
+            }
+            Instruction::ADDIMM(raw) => {
+                // 7xkk - Set Vx = Vx + kk
+                let register = raw.nibble_at(1) as usize;
+                let immediate = raw.1;
+                let current_value = self.state.registers[register];
+                self.state.registers[register] = current_value + immediate;
+                self.increment_program_counter(2);
+            }
+            Instruction::LDREG(raw) => {
+                // 8xy0 - stores the value of register Vy in register Vx
+                self.state.registers[raw.nibble_at(1) as usize] =
+                    self.state.registers[raw.nibble_at(2) as usize];
+                self.increment_program_counter(2);
+            }
+            Instruction::ORREG(raw) => {
+                // 8xy1  - Set Vx = Vx OR Vy
+                let vx_index = raw.nibble_at(1) as usize;
+                let vx = self.state.registers[vx_index];
+                let vy = self.state.registers[raw.nibble_at(2) as usize];
+
+                self.state.registers[vx_index] = vx | vy;
+                self.increment_program_counter(2);
+            }
+            Instruction::ANDREG(raw) => {
+                // 8xy2 - Set Vx = Vx AND Vy
+                let vx_index = raw.nibble_at(1) as usize;
+                let vx = self.state.registers[vx_index];
+                let vy = self.state.registers[raw.nibble_at(2) as usize];
+
+                self.state.registers[vx_index] = vx & vy;
+                self.increment_program_counter(2);
+            }
+            Instruction::XORREG(raw) => {
+                let vx_index = raw.nibble_at(1) as usize;
+                let vx = self.state.registers[vx_index];
+                let vy = self.state.registers[raw.nibble_at(2) as usize];
+
+                self.state.registers[vx_index] = vx ^ vy;
+                self.increment_program_counter(2);
+            }
+            Instruction::ADDREG(raw) => {
+                // 8xy4 - Set Vx = Vx + Vy, set VF = carry
+                let vx_index = raw.nibble_at(1) as usize;
+                let vx = self.state.registers[vx_index];
+                let vy = self.state.registers[raw.nibble_at(2) as usize];
+
+                self.state.registers[0xF] = 0;
+                self.state.registers[vx_index] = vx.wrapping_add(vy);
+                // If overflow, set VF = 1
+                if vx.checked_add(vy).is_none() {
+                    self.state.registers[0xF] = 1;
+                }
+                self.increment_program_counter(2);
+            }
+            Instruction::SUBREG(raw) => {
+                // 8xy5 - Set Vx = Vx - Vy, Set VF = NOT borrow
+                let vx_index = raw.nibble_at(1) as usize;
+                let vx = self.state.registers[vx_index];
+                let vy = self.state.registers[raw.nibble_at(2) as usize];
+
+                // If Vx > Vy, then VF is set to 1, otherwise 0. Then Vy is
+                // subtracted from Vx, and the results stored in Vx.
+                match vx > vy {
+                    true => self.state.registers[0xF] = 1,
+                    false => self.state.registers[0xF] = 0,
+                };
+
+                self.state.registers[vx_index] = vx - vy;
+                self.increment_program_counter(2);
+            }
+            Instruction::SHR(raw) => {
+                // 8xy6 - Set Vx = Vx SHR 1, VF = whether Vx least sig. bit = 1
+                let vx_index = raw.nibble_at(1) as usize;
+                let vx = self.state.registers[vx_index];
+
+                // If the least-significant bit of Vx is 1, then VF is set to 1,
+                // otherwise 0. Then Vx is divided by 2.
+                match vx & 1 {
+                    1 => self.state.registers[0xF] = 1,
+                    _ => self.state.registers[0xF] = 0,
+                }
+
+                self.state.registers[vx_index] = vx / 2;
+                self.increment_program_counter(2);
+            }
+            Instruction::RSUBREG(raw) => {
+                // 8xy7 - Set Vx = Vy - Vx, set VF = NOT borrow
+                let vx_index = raw.nibble_at(1) as usize;
+                let vx = self.state.registers[vx_index];
+                let vy = self.state.registers[raw.nibble_at(2) as usize];
+
+                // If Vy > Vx, then VF is set to 1, otherwise 0. Then Vx is
+                // subtracted from Vy, and the results stored in Vx.
+                match vy > vx {
+                    true => self.state.registers[0xF] = 1,
+                    false => self.state.registers[0xF] = 0,
+                };
+
+                self.state.registers[vx_index] = vy - vx;
+                self.increment_program_counter(2);
+            }
+            Instruction::SHL(raw) => {
+                // 8xyE - Set Vx = Vx SHL 1, set VF = whether Vx most sig. bit = 1
+                let vx_index = raw.nibble_at(1) as usize;
+                let vx = self.state.registers[vx_index];
+
+                match vx >> 7 {
+                    1 => self.state.registers[0xF] = 1,
+                    _ => self.state.registers[0xF] = 0,
+                };
+
+                self.state.registers[vx_index] = vx * 2;
+                self.increment_program_counter(2);
+            }
+            Instruction::SNEREG(raw) => {
+                // 9xy0 - Skip next instruction if Vx != Vy
+                let vx = self.state.registers[raw.nibble_at(1) as usize];
+                let vy = self.state.registers[raw.nibble_at(2) as usize];
+
+                if vx != vy {
+                    self.increment_program_counter(4);
+                } else {
+                    self.increment_program_counter(2);
+                }
+            }
             Instruction::LDIMMI(raw) => {
+                // ANNN - Set register I equal to NNN
                 let immediate = raw.as_u16() & 0x0FFF;
                 self.state.index_register = immediate;
                 self.increment_program_counter(2);
-            },
+            }
+            Instruction::JMPV0(raw) => {
+                // BNNN - Set program counter to NNN + V0
+                let immediate = raw.as_u16() & 0x0FFF;
+                self.state.program_counter = immediate + self.state.registers[0] as u16;
+            }
+            Instruction::RND(raw) => {
+                // Cxkk - Set a random 8-bit number AND'd with kk into register Vx
+                let seed = self.rng.gen::<u8>();
+                // SAFETY: I'm masking off the last 8 bits, so I know it's an 8 bit number
+                let immediate: u8 = (raw.as_u16() & 0x00FF).try_into().unwrap();
+                self.state.registers[raw.nibble_at(1) as usize] = seed & immediate;
+                self.increment_program_counter(2);
+            }
             Instruction::DRW(raw) => {
                 let starting_addr = self.state.index_register as usize;
                 let sprite_len = raw.nibble_at(3) as usize;
@@ -299,14 +481,34 @@ impl VM {
 
                 self.increment_program_counter(2);
                 return ExecutionResult::Draw;
-            },
-            Instruction::LDSPRITE(raw) => {
-                // Fx29 - Set I to the memory location of the sprite
-                // corresponding to the number in Vx
+            }
+            Instruction::SKP(raw) => {
+                // Ex9E - Skip next instruction if key with value of Vx is pressed
                 let vx = self.state.registers[raw.nibble_at(1) as usize];
-                self.state.index_register = (5 * vx) as u16;
                 self.increment_program_counter(2);
-            },
+                if let Some(keycode) = Chip8Key::from_u8(vx) {
+                    if self.keyboard_state.is_key_pressed(keycode) {
+                        // Increment by 2 more if key is pressed
+                        self.increment_program_counter(2);
+                    }
+                }
+            }
+            Instruction::SKNP(raw) => {
+                // ExA1 - Skip next instruction if key with value of Vx is NOT presse0d.
+                let vx = self.state.registers[raw.nibble_at(1) as usize];
+                self.increment_program_counter(4);
+                if let Some(keycode) = Chip8Key::from_u8(vx) {
+                    if self.keyboard_state.is_key_pressed(keycode) {
+                        // If key is pressed, undo the skip
+                        self.state.program_counter -= 2;
+                    }
+                }
+            }
+            Instruction::LDDELAY(raw) => {
+                // Fx07 - Set Vx to delay timer value
+                self.state.registers[raw.nibble_at(1) as usize] = self.state.delay_timer;
+                self.increment_program_counter(2);
+            }
             Instruction::LDKEY(raw) => {
                 // Fx0A - yield execution back to the main game loop until the
                 // user presses a key, after which the value of the key will be
@@ -314,11 +516,54 @@ impl VM {
                 let reg = raw.nibble_at(1);
                 self.increment_program_counter(2);
                 return ExecutionResult::WaitForKey(reg);
-            },
-            _ => println!("    -> Unhandled")
+            }
+            Instruction::SETDELAY(raw) => {
+                // Fx15 - Set delay timer to value of Vx
+                self.state.delay_timer = self.state.registers[raw.nibble_at(1) as usize];
+                self.increment_program_counter(2);
+            }
+            Instruction::LDSOUND(raw) => {
+                // Fx18 - Set sounter timer = value in Vx
+                self.state.sound_timer = self.state.registers[raw.nibble_at(1) as usize];
+                self.increment_program_counter(2);
+            }
+            Instruction::ADDINDEX(raw) => {
+                // Fx1E - Set I = Vx + I
+                self.state.index_register = self.state.registers[raw.nibble_at(1) as usize] as u16
+                    + self.state.index_register;
+                self.increment_program_counter(2);
+            }
+            Instruction::LDSPRITE(raw) => {
+                // Fx29 - Set I to the memory location of the sprite
+                // corresponding to the number in Vx
+                let vx = self.state.registers[raw.nibble_at(1) as usize];
+                self.state.index_register = (5 * vx) as u16;
+                self.increment_program_counter(2);
+            }
+            Instruction::LDIDECIMAL(_raw) => {
+                // Fx33 - Loads hundreds, tens, 1s place of decimal value of Fx
+                // into I, I + 1, I + 2
+                todo!()
+            }
+            Instruction::STOREREG(raw) => {
+                for i in 0..self.state.registers[raw.nibble_at(1) as usize] {
+                    self.state.memory[(self.state.index_register + i as u16) as usize] =
+                        self.state.registers[i as usize];
+                }
+                self.increment_program_counter(2);
+            }
+            Instruction::LDMEM(raw) => {
+                // Fx65 - Read memory contents into registers V0 through Vx starting at I
+                for i in 0..self.state.registers[raw.nibble_at(1) as usize] {
+                    self.state.registers[i as usize] =
+                        self.state.memory[(self.state.index_register + i as u16) as usize];
+                }
+                self.increment_program_counter(2);
+            }
+            _ => todo!(),
         };
 
-        ExecutionResult::Nothing
+        ExecutionResult::Done
     }
 }
 
@@ -331,7 +576,7 @@ impl RawInstruction {
             1 => self.0 & 0x0F,
             2 => (self.1 & 0xF0) >> 4,
             3 => self.1 & 0x0F,
-            idx => panic!("index out of range {}", idx)
+            idx => panic!("index out of range {}", idx),
         }
     }
 
@@ -367,7 +612,7 @@ enum Instruction {
     RET(RawInstruction),
     /// 1NNN - Jump to location NNN
     JMP(RawInstruction),
-    /// 2NNN - Call subroute at NNN
+    /// 2NNN - Call subroutine at NNN
     CALL(RawInstruction),
     /// 3xkk - Skip next instruction if Vx = kk
     SEIMM(RawInstruction),
@@ -391,7 +636,7 @@ enum Instruction {
     ADDREG(RawInstruction),
     /// 8xy5 - Set Vx = Vx - Vy, Set VF = NOT borrow
     SUBREG(RawInstruction),
-    /// 8xy6 - Set Vx = Vx SHR 1, VF = whether Vx least sig. bit = 1 
+    /// 8xy6 - Set Vx = Vx SHR 1, VF = whether Vx least sig. bit = 1
     SHR(RawInstruction),
     /// 8xy7 - Set Vx = Vy - Vx, set VF = NOT borrow
     RSUBREG(RawInstruction),
@@ -402,7 +647,7 @@ enum Instruction {
     /// ANNN - Set register I equal to NNN
     LDIMMI(RawInstruction),
     /// BNNN - Set program counter to NNN + V0
-    JPV0(RawInstruction),
+    JMPV0(RawInstruction),
     /// Cxkk - Set a random 8-bit number AND'd with kk into register Vx
     RND(RawInstruction),
     /// Dxyn - Display n-byte sprite starting at I, set VF = collision
@@ -417,7 +662,7 @@ enum Instruction {
     LDKEY(RawInstruction),
     /// Fx15 - Set delay timer to value of Vx
     SETDELAY(RawInstruction),
-    /// Fx18 - Set sounter timer = value in Vx
+    /// Fx18 - Set sound timer = value in Vx
     LDSOUND(RawInstruction),
     /// Fx1E - Set I = Vx + I
     ADDINDEX(RawInstruction),
@@ -428,7 +673,7 @@ enum Instruction {
     /// Fx55 - Store registers V0 through Vx into memory starting at I
     STOREREG(RawInstruction),
     /// Fx65 - Read memory contents into registers V0 through Vx starting at I
-    LDMEM(RawInstruction)
+    LDMEM(RawInstruction),
 }
 
 impl Instruction {
@@ -440,7 +685,7 @@ impl Instruction {
                 (0x00, 0xE0) => Ok(Instruction::CLS(ri)),
                 (0x00, 0xEE) => Ok(Instruction::RET(ri)),
                 _ => Ok(Instruction::SYS(ri)),
-            }
+            },
             1 => Ok(Instruction::JMP(ri)),
             2 => Ok(Instruction::CALL(ri)),
             3 => Ok(Instruction::SEIMM(ri)),
@@ -458,17 +703,25 @@ impl Instruction {
                 6 => Ok(Instruction::SHR(ri)),
                 7 => Ok(Instruction::RSUBREG(ri)),
                 0xE => Ok(Instruction::SHL(ri)),
-                _ => Err(eyre!("Unknown 0x8xxx opcode 0x{:02X}{:02X}", bytes.0, bytes.1))
+                _ => Err(eyre!(
+                    "Unknown 0x8xxx opcode 0x{:02X}{:02X}",
+                    bytes.0,
+                    bytes.1
+                )),
             },
             9 => Ok(Instruction::SNEREG(ri)),
             0xA => Ok(Instruction::LDIMMI(ri)),
-            0xB => Ok(Instruction::JPV0(ri)),
+            0xB => Ok(Instruction::JMPV0(ri)),
             0xC => Ok(Instruction::RND(ri)),
             0xD => Ok(Instruction::DRW(ri)),
             0xE => match bytes.1 {
                 0x9E => Ok(Instruction::SKP(ri)),
                 0xA1 => Ok(Instruction::SKNP(ri)),
-                _ => Err(eyre!("Unknown 0xEx opcode 0x{:02X}{:02X}", bytes.0, bytes.1))
+                _ => Err(eyre!(
+                    "Unknown 0xEx opcode 0x{:02X}{:02X}",
+                    bytes.0,
+                    bytes.1
+                )),
             },
             0xF => match bytes.1 {
                 0x07 => Ok(Instruction::LDDELAY(ri)),
@@ -480,9 +733,13 @@ impl Instruction {
                 0x33 => Ok(Instruction::LDIDECIMAL(ri)),
                 0x55 => Ok(Instruction::STOREREG(ri)),
                 0x65 => Ok(Instruction::LDMEM(ri)),
-                _ => Err(eyre!("Unknown 0xFx opcode 0x{:02X}{:02X}", bytes.0, bytes.1)),
+                _ => Err(eyre!(
+                    "Unknown 0xFx opcode 0x{:02X}{:02X}",
+                    bytes.0,
+                    bytes.1
+                )),
             },
-            seq => Err(eyre!("Unknown bytes sequence {:#04X}", seq))
+            seq => Err(eyre!("Unknown bytes sequence {:#04X}", seq)),
         }
     }
 }
@@ -491,7 +748,7 @@ impl Instruction {
 mod tests {
     use super::*;
 
-    #[test] 
+    #[test]
     fn test_raw_instruction_parse() {
         let instruction = RawInstruction(0x1F, 0x23);
         assert_eq!(instruction.nibble_at(1), 15);

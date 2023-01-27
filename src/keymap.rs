@@ -2,13 +2,14 @@
 /// state.  It maps SDL events to "virtual" chip8 key presses based on a
 /// keymap, and exposes mechanisms for storing key press state.
 use lazy_static::lazy_static;
+use num_derive::{FromPrimitive, ToPrimitive};
 use sdl2::keyboard::Keycode as SdlKeycode;
 use std::collections::HashMap;
 
 /// Represents the keys of a native Chip8 keyboard
-#[derive(Debug, Eq, PartialEq, Hash, Clone, Copy)]
+#[derive(Debug, Eq, PartialEq, Hash, Clone, Copy, FromPrimitive, ToPrimitive)]
 pub enum Chip8Key {
-    K0,
+    K0 = 0,
     K1,
     K2,
     K3,
