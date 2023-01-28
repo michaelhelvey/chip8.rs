@@ -11,9 +11,9 @@ use crate::{
 };
 
 // Window configuration:
-const PX_SCALING: u32 = 20;
-const WINDOW_HEIGHT: u32 = ROWS * PX_SCALING;
-const WINDOW_WIDTH: u32 = COLS * PX_SCALING;
+const PX_SCALING: usize = 20;
+const WINDOW_HEIGHT: usize = ROWS * PX_SCALING;
+const WINDOW_WIDTH: usize = COLS * PX_SCALING;
 const WINDOW_TITLE: &'static str = "CHIP8 Emulator";
 
 // Color configuration
@@ -41,7 +41,11 @@ impl GraphicsContext {
             .map_err(|e| eyre!("Could not init video subsystem: {}", e))?;
 
         let window = video_subsystem
-            .window(WINDOW_TITLE, WINDOW_WIDTH, WINDOW_HEIGHT)
+            .window(
+                WINDOW_TITLE,
+                WINDOW_WIDTH.try_into().unwrap(),
+                WINDOW_HEIGHT.try_into().unwrap(),
+            )
             .position_centered()
             .build()?;
 
@@ -74,7 +78,8 @@ impl GraphicsContext {
 
                 let x = (col * PX_SCALING) as i32;
                 let y = (row * PX_SCALING) as i32;
-                let rect = Rect::new(x, y, PX_SCALING, PX_SCALING);
+                let scaling: u32 = PX_SCALING.try_into().unwrap();
+                let rect = Rect::new(x, y, scaling, scaling);
 
                 self.canvas.set_draw_color(foreground_color);
                 self.canvas

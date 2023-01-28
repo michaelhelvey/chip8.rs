@@ -73,10 +73,12 @@ impl KeyboardState {
     }
 
     pub fn on_keyup(&mut self, keycode: Chip8Key) {
-        self.map.insert(keycode, false);
+        println!("on_keyup: {:?}", keycode);
+        self.map.remove(&keycode);
     }
 
     pub fn on_keydown(&mut self, keycode: Chip8Key) {
+        println!("on_keydown: {:?}", keycode);
         self.map.insert(keycode, true);
     }
 

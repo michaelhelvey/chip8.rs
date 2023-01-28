@@ -10,7 +10,7 @@ pub mod screenbuffer;
 pub mod vm;
 
 // Timing config:
-const CLOCK_SPEED: u64 = 540;
+const CLOCK_SPEED: u64 = 120;
 const FRAME_RATE: u64 = 60;
 const FRAME_DURATION: Duration = Duration::from_millis(1000 / FRAME_RATE);
 
@@ -40,6 +40,7 @@ fn main() -> color_eyre::Result<()> {
     let mut vm = vm::VM::new(program.as_slice());
     let mut graphics_context = GraphicsContext::new()?;
     let mut frame_start = Instant::now();
+    vm.set_test_suite(2);
 
     // Separating instructions per frame from instructions to execute on a given
     // iteration of the game loop allows us to maintain a fairly constant clock
@@ -56,7 +57,7 @@ fn main() -> color_eyre::Result<()> {
             }
         }
 
-        // TODO:  handle decrementing the sound & delay timers
+        // TODO:  handle decrementing the sound & delay timers correctly
         let (exe_result, exe_count) = vm.render_frame(instructions_to_execute)?;
         match exe_result {
             ExecutionResult::WaitForKey(register) => {
@@ -72,10 +73,13 @@ fn main() -> color_eyre::Result<()> {
                     instructions_to_execute = instructions_remaining;
                 } else {
                     instructions_to_execute = instructions_per_frame;
+                    vm.tick_timers();
+                    sleep(&mut frame_start);
                 }
             }
             ExecutionResult::Done => {
                 instructions_to_execute = instructions_per_frame;
+                vm.tick_timers();
                 sleep(&mut frame_start);
             }
         }

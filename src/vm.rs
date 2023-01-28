@@ -9,16 +9,45 @@ use num_traits::FromPrimitive;
 use rand::rngs::ThreadRng;
 use rand::Rng;
 
+struct Stack {
+    stack: [u16; 16],
+    ptr: usize,
+}
+
+impl Stack {
+    const fn new() -> Self {
+        Self {
+            stack: [0; 16],
+            ptr: 0,
+        }
+    }
+
+    fn push(&mut self, val: u16) {
+        if self.ptr == 0xF {
+            panic!("stack overflow");
+        }
+
+        self.stack[self.ptr] = val;
+        self.ptr += 1;
+    }
+
+    fn pop(&mut self) -> Option<u16> {
+        if self.ptr == 0 {
+            return None;
+        }
+        self.ptr -= 1;
+        let result = self.stack[self.ptr];
+        Some(result)
+    }
+}
+
 struct VMState {
     registers: [u8; 16],
     index_register: u16,
     delay_timer: u8,
     sound_timer: u8,
     program_counter: u16,
-    stack_pointer: u8,
-    // Stack of return addresses for subroutines...not really a traditional
-    // "stack" from modern asm programming.
-    stack: [u16; 16],
+    stack: Stack,
     memory: [u8; 0xFFF],
 }
 
@@ -63,8 +92,7 @@ impl VMState {
             delay_timer: 0,
             sound_timer: 0,
             program_counter: program_counter_start,
-            stack_pointer: 0,
-            stack: [0; 16],
+            stack: Stack::new(),
             memory: [0; 0xFFF],
         };
 
@@ -162,6 +190,10 @@ impl VM {
         return &self.screenbuffer;
     }
 
+    pub fn set_test_suite(&mut self, suite: u8) {
+        self.state.memory[0x1FF] = suite;
+    }
+
     /// Execute (up to) enough instructions to render a single frame.  This
     /// function should be called at the game's framerate (probably 60hz, as
     /// this is the specified rate for decrementing the timer & delay
@@ -215,6 +247,7 @@ impl VM {
     /// Registers the ExecutionResult::WaitForKey as complete.  Note: does not
     /// implicitly call `on_keydown`
     pub fn wait_for_key_complete(&mut self, register: u8, keycode: Chip8Key) {
+        println!("wait_for_key_complete: {:?}, {}", keycode, keycode as u8);
         self.state.registers[register as usize] = keycode as u8;
     }
 
@@ -224,6 +257,16 @@ impl VM {
 
     pub fn on_keyup(&mut self, keycode: Chip8Key) {
         self.keyboard_state.on_keyup(keycode);
+    }
+
+    pub fn tick_timers(&mut self) {
+        if self.state.delay_timer > 0 {
+            self.state.delay_timer -= 1;
+        }
+
+        if self.state.sound_timer > 0 {
+            self.state.sound_timer -= 1;
+        }
     }
 
     fn increment_program_counter(&mut self, amount: u16) {
@@ -251,8 +294,7 @@ impl VM {
                 // 00EE - return from a subroutine
                 // Set the program counter to the address at the top of the
                 // stack, then subtract 1 from the stack pointer.
-                self.state.program_counter = self.state.stack[self.state.stack.len() - 1];
-                self.state.stack_pointer -= 1;
+                self.state.program_counter = self.state.stack.pop().unwrap();
             }
             Instruction::JMP(raw) => {
                 // 1NNN - Jump to location NNN
@@ -261,8 +303,7 @@ impl VM {
             }
             Instruction::CALL(raw) => {
                 // 2NNN - call subroutine at NNN
-                self.state.stack_pointer += 1;
-                self.state.stack[self.state.stack_pointer as usize] = self.state.program_counter;
+                self.state.stack.push(self.state.program_counter);
                 let routine_addr = raw.as_u16() & 0x0FFF;
                 self.state.program_counter = routine_addr;
             }
@@ -310,7 +351,7 @@ impl VM {
                 let register = raw.nibble_at(1) as usize;
                 let immediate = raw.1;
                 let current_value = self.state.registers[register];
-                self.state.registers[register] = current_value + immediate;
+                self.state.registers[register] = current_value.overflowing_add(immediate).0;
                 self.increment_program_counter(2);
             }
             Instruction::LDREG(raw) => {
@@ -444,18 +485,18 @@ impl VM {
             Instruction::RND(raw) => {
                 // Cxkk - Set a random 8-bit number AND'd with kk into register Vx
                 let seed = self.rng.gen::<u8>();
-                // SAFETY: I'm masking off the last 8 bits, so I know it's an 8 bit number
-                let immediate: u8 = (raw.as_u16() & 0x00FF).try_into().unwrap();
+                let immediate: u8 = raw.1;
                 self.state.registers[raw.nibble_at(1) as usize] = seed & immediate;
                 self.increment_program_counter(2);
             }
             Instruction::DRW(raw) => {
+                // Dxyn - Display n-byte sprite starting at I, set VF = collision
                 let starting_addr = self.state.index_register as usize;
                 let sprite_len = raw.nibble_at(3) as usize;
 
                 // Coordinates (wrapped around if larger than screen):
-                let vx = self.state.registers[raw.nibble_at(1) as usize];
-                let vy = self.state.registers[raw.nibble_at(2) as usize];
+                let vx = self.state.registers[raw.nibble_at(1) as usize] as usize % COLS;
+                let vy = self.state.registers[raw.nibble_at(2) as usize] as usize % ROWS;
                 self.state.registers[0xF] = 0;
 
                 // Sprite data, represented as an array of bytes. Each byte is a
@@ -464,15 +505,19 @@ impl VM {
 
                 // For each row (byte) in the sprite:
                 for (row, sprite_byte) in sprite_data.iter().enumerate() {
+                    if row + vy > ROWS {
+                        break;
+                    }
                     // For each column (pixel) from left to right inside the byte:
                     for position in 0..8 {
-                        let pixel_value = (sprite_byte & (1 << (7 - position))) > 0;
+                        let x = vx + position as usize;
 
-                        // Render the pixel as an offset from the initial start
-                        // (vx, vy), wrapping when that value would be larger
-                        // than the screen:
-                        let x = (vx + position) as usize % COLS as usize;
-                        let y = vy as usize + row % ROWS as usize;
+                        if x > COLS {
+                            break;
+                        }
+
+                        let pixel_value = (sprite_byte & (1 << (7 - position))) > 0;
+                        let y = vy + row;
                         if self.screenbuffer.write_pixel(pixel_value, x, y) {
                             self.state.registers[0xF] = 1;
                         }
@@ -494,14 +539,16 @@ impl VM {
                 }
             }
             Instruction::SKNP(raw) => {
-                // ExA1 - Skip next instruction if key with value of Vx is NOT presse0d.
+                // ExA1 - Skip next instruction if key with value of Vx is NOT pressed.
                 let vx = self.state.registers[raw.nibble_at(1) as usize];
-                self.increment_program_counter(4);
-                if let Some(keycode) = Chip8Key::from_u8(vx) {
-                    if self.keyboard_state.is_key_pressed(keycode) {
-                        // If key is pressed, undo the skip
-                        self.state.program_counter -= 2;
-                    }
+                dbg!(vx);
+                if self
+                    .keyboard_state
+                    .is_key_pressed(Chip8Key::from_u8(vx).unwrap())
+                {
+                    self.increment_program_counter(2);
+                } else {
+                    self.increment_program_counter(4);
                 }
             }
             Instruction::LDDELAY(raw) => {
@@ -540,10 +587,19 @@ impl VM {
                 self.state.index_register = (5 * vx) as u16;
                 self.increment_program_counter(2);
             }
-            Instruction::LDIDECIMAL(_raw) => {
+            Instruction::LDIDECIMAL(raw) => {
                 // Fx33 - Loads hundreds, tens, 1s place of decimal value of Fx
                 // into I, I + 1, I + 2
-                todo!()
+                let vx = self.state.registers[raw.nibble_at(1) as usize];
+                let i = self.state.index_register as usize;
+                let h_digit = vx / 100;
+                let t_digit = (vx - h_digit * 100) / 10;
+                let o_digit = vx - ((h_digit * 100) + t_digit);
+
+                self.state.memory[i] = h_digit;
+                self.state.memory[i + 1] = t_digit;
+                self.state.memory[i + 2] = o_digit;
+                self.increment_program_counter(2);
             }
             Instruction::STOREREG(raw) => {
                 for i in 0..self.state.registers[raw.nibble_at(1) as usize] {
@@ -554,7 +610,7 @@ impl VM {
             }
             Instruction::LDMEM(raw) => {
                 // Fx65 - Read memory contents into registers V0 through Vx starting at I
-                for i in 0..self.state.registers[raw.nibble_at(1) as usize] {
+                for i in 0..(raw.nibble_at(1) + 1) as usize {
                     self.state.registers[i as usize] =
                         self.state.memory[(self.state.index_register + i as u16) as usize];
                 }
@@ -768,5 +824,16 @@ mod tests {
         let instruction = RawInstruction(11, 34);
         assert_eq!(instruction.as_u16(), 2850);
         assert_eq!(instruction.as_u16() & 0x0FFF, 2850);
+    }
+
+    #[test]
+    fn test_stack() {
+        let mut stack = Stack::new();
+        assert_eq!(stack.pop().is_none(), true);
+        stack.push(1);
+        stack.push(2);
+        assert_eq!(stack.pop().unwrap(), 2);
+        assert_eq!(stack.pop().unwrap(), 1);
+        assert_eq!(stack.pop().is_none(), true);
     }
 }

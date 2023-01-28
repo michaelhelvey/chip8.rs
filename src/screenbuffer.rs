@@ -1,5 +1,5 @@
-pub const ROWS: u32 = 32;
-pub const COLS: u32 = 64;
+pub const ROWS: usize = 32;
+pub const COLS: usize = 64;
 
 const BUFFER_SIZE: usize = 64 * 32;
 const FRONT_BUFFER: [bool; BUFFER_SIZE] = [false; BUFFER_SIZE];
@@ -35,12 +35,9 @@ impl ScreenBuffer {
     pub fn write_pixel(&mut self, value: bool, x: usize, y: usize) -> bool {
         let index = (COLS as usize * y) + x;
         let previous_value = self.buffer[index];
-        self.buffer[index] = value;
+        self.buffer[index] ^= value;
 
-        return match previous_value {
-            true if value == false => true,
-            _ => false,
-        };
+        previous_value & value
     }
 
     pub fn read_pixel(&self, x: usize, y: usize) -> bool {
